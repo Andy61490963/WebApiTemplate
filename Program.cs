@@ -1,3 +1,5 @@
+using System.Reflection;
+using System.Runtime.InteropServices;
 using LoaderScheduler.Configuration;
 using LoaderScheduler.Logging;
 using LoaderScheduler.Services.Infrastructure;
@@ -7,98 +9,79 @@ using LoaderScheduler.Services.Service;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 using Serilog;
 
 namespace LoaderScheduler;
 
-/// <summary>
-/// 程式進入點，設定主機與背景作業。
-/// </summary>
-/// <remarks>Remark: 以通用主機搭配 Serilog 與選項模式構建常駐排程程式。</remarks>
 public static class Program
 {
-    /// <summary>
-    /// 應用程式主要進入點。
-    /// </summary>
-    /// <param name="args">命令列參數。</param>
+    private const string WindowsServiceName = "Loader Scheduler";
+
     public static async Task Main(string[] args)
     {
         Log.Logger = SerilogConfigurator.CreateBootstrapLogger();
 
         try
         {
-            var builder = Host.CreateApplicationBuilder(args);
-            builder.Host.UseWindowsService();
-            builder.Host.UseSystemd();
-            ConfigureConfiguration(builder);
-            ConfigureLogging(builder);
-            ConfigureServices(builder);
-
-            using var host = builder.Build();
+            using var host = BuildHost(args);
             await host.RunAsync().ConfigureAwait(false);
         }
-        catch (Exception exception)
+        catch (Exception ex)
         {
-            Log.Fatal(exception, "應用程式啟動失敗。");
-            throw;
+            Log.Fatal(ex, "Application terminated unexpectedly.");
+            Environment.ExitCode = 1;
         }
         finally
         {
-            await Log.CloseAndFlushAsync().ConfigureAwait(false);
+            Log.CloseAndFlush();
         }
     }
 
-    private static void ConfigureConfiguration(HostApplicationBuilder builder)
-    {
-        builder.Configuration
-            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-            .AddJsonFile($"appsettings.{builder.Environment.EnvironmentName}.json", optional: true, reloadOnChange: true)
-            .AddEnvironmentVariables();
-    }
+    private static IHost BuildHost(string[] args) =>
+        Host.CreateDefaultBuilder(args)
+            // 設定檔：沿用預設（appsettings.json / appsettings.{Env}.json / 環境變數）
+            .ConfigureAppConfiguration((hosting, config) =>
+            {
+                // 需要強制存在 appsettings.json 可保留 optional: false
+                config.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
+                // 若有其他自定設定來源可在這邊加
+            })
+            // Windows 服務（在非 Windows 也不會炸）
+            .UseWindowsService(options => options.ServiceName = WindowsServiceName)
+            // Serilog：以正式設定覆蓋 bootstrap logger
+            .UseSerilog((context, _, loggerConfiguration) =>
+                SerilogConfigurator.Configure(loggerConfiguration, context.Configuration, context.HostingEnvironment),
+                preserveStaticLogger: true)
+            // 服務註冊
+            .ConfigureServices((context, services) =>
+            {
+                var cfg = context.Configuration;
 
-    private static void ConfigureLogging(HostApplicationBuilder builder)
-    {
-        builder.Host.UseSerilog((context, _, loggerConfiguration) =>
-        {
-            SerilogConfigurator.Configure(loggerConfiguration, context.Configuration, context.HostingEnvironment);
-        });
-    }
+                // ---- Options 綁定（模仿你的 Kaosu 寫法，先取出、Validate、再註冊）----
+                var scheduler = cfg.GetSection("Scheduler").Get<SchedulerOptions>() ?? new SchedulerOptions();
+                // 需要的話可在 SchedulerOptions 內實作 Validate() 做更嚴格檢查
+                // scheduler.Validate();
 
-    private static void ConfigureServices(HostApplicationBuilder builder)
-    {
-        RegisterOptions(builder);
+                var dbOptions = new DatabaseOptions
+                {
+                    ConnectionString = cfg.GetConnectionString("DefaultConnection") ?? string.Empty
+                };
+                if (string.IsNullOrWhiteSpace(dbOptions.ConnectionString))
+                    throw new InvalidOperationException("請在 appsettings.json 設定 ConnectionStrings:DefaultConnection。");
 
-        builder.Services.AddSingleton<ISqlConnectionFactory, SqlConnectionFactory>();
-        builder.Services.AddSingleton<IDapperRepository, DapperRepository>();
-        builder.Services.AddSingleton<IJob, ExampleJob>();
-        builder.Services.AddHostedService<Worker>();
-    }
+                var logging = cfg.GetSection("Logging").Get<LoggingOptions>() ?? new LoggingOptions();
 
-    private static void RegisterOptions(HostApplicationBuilder builder)
-    {
-        builder.Services.AddOptions<SchedulerOptions>()
-            .Bind(builder.Configuration.GetSection("Scheduler"))
-            .ValidateDataAnnotations()
-            .Validate(options => options.IntervalSeconds > 0, "IntervalSeconds 必須大於零。")
-            .ValidateOnStart();
+                services.AddSingleton(scheduler);
+                services.AddSingleton(logging);
+                // IOptions 包一層，方便其他組件用 IOptions<DatabaseOptions> 取用
+                services.AddSingleton<IOptions<DatabaseOptions>>(_ => Options.Create(dbOptions));
 
-        builder.Services.AddOptions<DatabaseOptions>()
-            .Configure(options => options.ConnectionString = GetRequiredConnectionString(builder.Configuration))
-            .Validate(options => !string.IsNullOrWhiteSpace(options.ConnectionString), "ConnectionString 不得為空白。")
-            .ValidateOnStart();
-
-        builder.Services.AddOptions<LoggingOptions>()
-            .Bind(builder.Configuration.GetSection("Logging"));
-    }
-
-    private static string GetRequiredConnectionString(IConfiguration configuration)
-    {
-        var connectionString = configuration.GetConnectionString("DefaultConnection");
-        if (string.IsNullOrWhiteSpace(connectionString))
-        {
-            throw new InvalidOperationException("請在 appsettings.json 中設定 ConnectionStrings:DefaultConnection。");
-        }
-
-        return connectionString;
-    }
+                // ---- 基礎設施與業務服務 ----
+                services.AddSingleton<ISqlConnectionFactory, SqlConnectionFactory>();
+                services.AddSingleton<IDapperRepository, DapperRepository>();
+                services.AddSingleton<IJob, ExampleJob>();
+                services.AddHostedService<Worker>();
+            })
+            .Build();
 }

@@ -1,6 +1,7 @@
 using System.Data.Common;
 using System.Data.SqlClient;
 using LoaderScheduler.Configuration;
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
