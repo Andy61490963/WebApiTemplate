@@ -1,69 +1,87 @@
-using WebApiTemplate.Application.Interfaces;
-using WebApiTemplate.Filters;
-using WebApiTemplate.Infrastructure.Db;
-using WebApiTemplate.Infrastructure.Security;
-using WebApiTemplate.Infrastructure.Services;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using LoaderScheduler.Configuration;
+using LoaderScheduler.Logging;
+using LoaderScheduler.Services.Infrastructure;
+using LoaderScheduler.Services.Interface;
+using LoaderScheduler.Services.Processing;
+using LoaderScheduler.Services.Service;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
+using Serilog;
 
-namespace WebApiTemplate;
+namespace LoaderScheduler;
 
-/// <summary>
-/// 應用程式進入點。
-/// </summary>
-/// <remarks>Remark: 設定 DI、Swagger 與中介軟體管線。</remarks>
-public class Program
+public static class Program
 {
-    /// <summary>
-    /// 主函式。
-    /// </summary>
-    /// <param name="args">命令列參數。</param>
-    public static void Main(string[] args)
+    private const string WindowsServiceName = "Loader Scheduler";
+
+    public static async Task Main(string[] args)
     {
-        var builder = WebApplication.CreateBuilder(args);
+        Log.Logger = SerilogConfigurator.CreateBootstrapLogger();
 
-        ConfigureServices(builder);
-
-        var app = builder.Build();
-
-        ConfigurePipeline(app);
-
-        app.Run();
-    }
-
-    /// <summary>
-    /// 註冊應用程式所需服務。
-    /// </summary>
-    /// <param name="builder">Web 應用程式產生器。</param>
-    /// <remarks>Remark: 包含 MVC、Swagger 以及自訂相依性。</remarks>
-    private static void ConfigureServices(WebApplicationBuilder builder)
-    {
-        builder.Services.AddControllers(options =>
+        try
         {
-            options.Filters.Add<ApiExceptionFilter>();
-        });
-
-        builder.Services.AddEndpointsApiExplorer();
-        builder.Services.AddSwaggerGen();
-
-        builder.Services.AddSingleton<SqlConnectionFactory>();
-        builder.Services.AddSingleton<JwtTokenFactory>();
-        builder.Services.AddSingleton<PasswordHasher>();
-        builder.Services.AddScoped<IAuthService, AuthService>();
+            using var host = BuildHost(args);
+            await host.RunAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Fatal(ex, "Application terminated unexpectedly.");
+            Environment.ExitCode = 1;
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+        }
     }
 
-    /// <summary>
-    /// 設定 HTTP 處理管線。
-    /// </summary>
-    /// <param name="app">Web 應用程式。</param>
-    /// <remarks>Remark: 啟用 Swagger、HTTPS 與路由。</remarks>
-    private static void ConfigurePipeline(WebApplication app)
-    {
-        app.UseSwagger();
-        app.UseSwaggerUI();
+    private static IHost BuildHost(string[] args) =>
+        Host.CreateDefaultBuilder(args)
+            // 設定檔：沿用預設（appsettings.json / appsettings.{Env}.json / 環境變數）
+            .ConfigureAppConfiguration((hosting, config) =>
+            {
+                // 需要強制存在 appsettings.json 可保留 optional: false
+                config.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
+                // 若有其他自定設定來源可在這邊加
+            })
+            // Windows 服務（在非 Windows 也不會炸）
+            .UseWindowsService(options => options.ServiceName = WindowsServiceName)
+            // Serilog：以正式設定覆蓋 bootstrap logger
+            .UseSerilog((context, _, loggerConfiguration) =>
+                SerilogConfigurator.Configure(loggerConfiguration, context.Configuration, context.HostingEnvironment),
+                preserveStaticLogger: true)
+            // 服務註冊
+            .ConfigureServices((context, services) =>
+            {
+                var cfg = context.Configuration;
 
-        app.UseHttpsRedirection();
+                // ---- Options 綁定（模仿你的 Kaosu 寫法，先取出、Validate、再註冊）----
+                var scheduler = cfg.GetSection("Scheduler").Get<SchedulerOptions>() ?? new SchedulerOptions();
+                // 需要的話可在 SchedulerOptions 內實作 Validate() 做更嚴格檢查
+                // scheduler.Validate();
 
-        app.UseAuthorization();
+                var dbOptions = new DatabaseOptions
+                {
+                    ConnectionString = cfg.GetConnectionString("DefaultConnection") ?? string.Empty
+                };
+                if (string.IsNullOrWhiteSpace(dbOptions.ConnectionString))
+                    throw new InvalidOperationException("請在 appsettings.json 設定 ConnectionStrings:DefaultConnection。");
 
-        app.MapControllers();
-    }
+                var logging = cfg.GetSection("Logging").Get<LoggingOptions>() ?? new LoggingOptions();
+
+                services.AddSingleton(scheduler);
+                services.AddSingleton(logging);
+                // IOptions 包一層，方便其他組件用 IOptions<DatabaseOptions> 取用
+                services.AddSingleton<IOptions<DatabaseOptions>>(_ => Options.Create(dbOptions));
+
+                // ---- 基礎設施與業務服務 ----
+                services.AddSingleton<ISqlConnectionFactory, SqlConnectionFactory>();
+                services.AddSingleton<IDapperRepository, DapperRepository>();
+                services.AddSingleton<IJob, ExampleJob>();
+                services.AddHostedService<Worker>();
+            })
+            .Build();
 }
